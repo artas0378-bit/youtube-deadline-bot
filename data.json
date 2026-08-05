@@ -1,0 +1,13 @@
+{
+    "users": {
+        "1378270054": {
+            "day": 2,
+            "status": "active",
+            "answered_today": false,
+            "start_date": "2026-08-03",
+            "stage_index": 0,
+            "last_push_date": "2026-08-05",
+            "custom_tasks": null
+        }
+    }
+}
