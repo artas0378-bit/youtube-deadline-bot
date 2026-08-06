@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timedelta
+import pytz
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
@@ -19,6 +20,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
     logging.warning("ВНИМАНИЕ: Задайте корректный BOT_TOKEN в файле .env!")
+
 
 # Настройка логирования
 logging.basicConfig(
@@ -99,7 +101,7 @@ def save_data(data):
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=pytz.timezone('Europe/Kyiv'))
 
 def get_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -178,7 +180,8 @@ def build_push_message(day: int, user_data):
     """
     Формирует текст ежедневного пуша.
     """
-    today_str = datetime.now().strftime("%d.%m.%Y")
+    tz = pytz.timezone('Europe/Kyiv')
+    today_str = datetime.now(tz).strftime("%d.%m.%Y")
     days_left = 14 - day
     task_today = get_user_task_for_day(user_data, day)
     
@@ -191,6 +194,44 @@ def build_push_message(day: int, user_data):
 
 # --- Обработчики команд ---
 
+def sync_user_day(user_data):
+    """
+    Синхронизирует текущий день цикла от сохраненной даты старта (start_date).
+    Если день цикла по календарю изменился, обновляет его и сбрасывает answered_today при необходимости.
+    """
+    tz = pytz.timezone('Europe/Kyiv')
+    today = datetime.now(tz).date()
+    
+    start_date_str = user_data.get("start_date")
+    if not start_date_str:
+        return user_data.get("day", 0)
+        
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    
+    # Разница в днях
+    day_diff = (today - start_date).days
+    
+    # День цикла должен быть от 0 до 14
+    calculated_day = max(0, min(14, day_diff))
+    
+    # Проверим, если рассчитанный день изменился
+    old_day = user_data.get("day", 0)
+    if calculated_day != old_day:
+        user_data["day"] = calculated_day
+        # Если день увеличился (наступил новый день), и он в диапазоне рабочих дней (1-13), 
+        # то пользователь еще не ответил на сегодня.
+        if calculated_day > old_day:
+            user_data["answered_today"] = False if 0 < calculated_day < 14 else True
+            
+            # Также нам нужно обновить stage_index для нового дня
+            if user_data.get("stage_index", -1) == -1 or calculated_day == 1:
+                for i, stage in enumerate(STAGES):
+                    if calculated_day in stage["days"]:
+                        user_data["stage_index"] = i
+                        break
+                        
+    return user_data["day"]
+
 def get_start_date_and_day():
     """
     Вычисляет дату начала 14-дневного цикла (прошлый понедельник от текущей даты)
@@ -199,7 +240,8 @@ def get_start_date_and_day():
     Если другой день (например, среда), вычисляется дата понедельника этой недели,
     и текущий день цикла будет равен разнице (например, 2 для среды).
     """
-    today = datetime.now().date()
+    tz = pytz.timezone('Europe/Kyiv')
+    today = datetime.now(tz).date()
     start_date = today - timedelta(days=today.weekday())
     day_diff = (today - start_date).days
     # Гарантируем, что день цикла находится в пределах 0-14
@@ -225,13 +267,14 @@ async def cmd_start(message: Message):
             stage_idx = i
             break
             
+    tz = pytz.timezone('Europe/Kyiv')
     data["users"][chat_id] = {
         "day": day,
         "status": "active",
         "answered_today": answered_today,
         "start_date": start_date.strftime("%Y-%m-%d"),
         "stage_index": stage_idx,
-        "last_push_date": datetime.now().strftime("%Y-%m-%d"),
+        "last_push_date": datetime.now(tz).strftime("%Y-%m-%d"),
         "custom_tasks": None
     }
     save_data(data)
@@ -268,6 +311,11 @@ async def cmd_status(message: Message):
         return
     
     user_data = data["users"][chat_id]
+    
+    # Синхронизируем день пользователя от даты старта
+    sync_user_day(user_data)
+    save_data(data)
+    
     day = user_data["day"]
     days_left = 14 - day
     stage_name = get_current_stage_name(user_data)
@@ -304,13 +352,14 @@ async def cmd_reset(message: Message):
             stage_idx = i
             break
             
+    tz = pytz.timezone('Europe/Kyiv')
     data["users"][chat_id] = {
         "day": day,
         "status": "active",
         "answered_today": answered_today,
         "start_date": start_date.strftime("%Y-%m-%d"),
         "stage_index": stage_idx,
-        "last_push_date": datetime.now().strftime("%Y-%m-%d"),
+        "last_push_date": datetime.now(tz).strftime("%Y-%m-%d"),
         "custom_tasks": None
     }
     save_data(data)
@@ -341,6 +390,7 @@ async def process_action_done(callback: CallbackQuery):
         return
         
     user_data = data["users"][chat_id]
+    sync_user_day(user_data)
     
     if user_data.get("answered_today", False):
         await callback.answer("Вы уже отметили выполнение или перенесли задачу на сегодня!", show_alert=True)
@@ -366,6 +416,7 @@ async def process_action_postpone(callback: CallbackQuery):
         return
         
     user_data = data["users"][chat_id]
+    sync_user_day(user_data)
     
     if user_data.get("answered_today", False):
         await callback.answer("Вы уже приняли решение на сегодня!", show_alert=True)
@@ -421,6 +472,7 @@ async def process_action_complete_stage(callback: CallbackQuery):
         return
         
     user_data = data["users"][chat_id]
+    sync_user_day(user_data)
     day = user_data["day"]
     
     # Определим, на каком этапе мы находимся по дню или по stage_index
@@ -508,6 +560,7 @@ async def auto_postpone_unanswered_users():
     
     for chat_id, user_data in data["users"].items():
         if user_data.get("status") == "active":
+            sync_user_day(user_data)
             day = user_data.get("day", 0)
             # Применяем перенос только для активных рабочих дней (с 1 по 12)
             if 0 < day < 13 and not user_data.get("answered_today", False):
@@ -548,41 +601,45 @@ async def auto_postpone_unanswered_users():
 async def send_morning_push():
     """
     Ежедневный утренний пуш в 09:00.
-    1. Инкрементирует день цикла на +1 (если статус active).
-    2. Отправляет пуш-сообщение с кнопками.
+    1. Синхронизирует день цикла с календарным.
+    2. Отправляет пуш-сообщение с кнопками (если пуш еще не отправлялся сегодня).
     """
     logger.info("Запуск отправки утренних пушей...")
     data = load_data()
     updated = False
+    tz = pytz.timezone('Europe/Kyiv')
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
     
     for chat_id, user_data in data["users"].items():
         if user_data.get("status") != "active":
             continue
             
-        current_day = user_data.get("day", 0)
+        # 1. Синхронизируем день пользователя от даты старта
+        sync_user_day(user_data)
+        updated = True
         
+        current_day = user_data.get("day", 0)
         if current_day >= 14:
             # Цикл завершен (День 14 - Релиз). Автоматического перехода нет, ждет ручного сброса
             continue
             
-        # 1. Переходим на следующий день цикла
-        next_day = current_day + 1
-        user_data["day"] = next_day
-        user_data["answered_today"] = False if 0 < next_day < 14 else True # На 14 день (релиз) кнопки не нужны, отмечаем как True
-        user_data["last_push_date"] = datetime.now().strftime("%Y-%m-%d")
+        # Проверим, отправляли ли мы уже пуш сегодня
+        if user_data.get("last_push_date") == today_str:
+            logger.info(f"Пуш сегодня уже отправлялся пользователю {chat_id} (День {current_day})")
+            continue
+            
+        user_data["last_push_date"] = today_str
         
         # Определим stage_index по новому дню, если он еще не переопределен кастомно
-        if user_data.get("stage_index", -1) == -1 or next_day == 1:
+        if user_data.get("stage_index", -1) == -1 or current_day == 1:
             for i, stage in enumerate(STAGES):
-                if next_day in stage["days"]:
+                if current_day in stage["days"]:
                     user_data["stage_index"] = i
                     break
         
-        updated = True
-        
         # 2. Отправка пуша
-        msg_text = build_push_message(next_day, user_data)
-        keyboard = get_action_keyboard(next_day)
+        msg_text = build_push_message(current_day, user_data)
+        keyboard = get_action_keyboard(current_day)
         
         try:
             await bot.send_message(
@@ -591,7 +648,7 @@ async def send_morning_push():
                 parse_mode="Markdown",
                 reply_markup=keyboard
             )
-            logger.info(f"Утренний пуш успешно отправлен пользователю {chat_id} (День {next_day})")
+            logger.info(f"Утренний пуш успешно отправлен пользователю {chat_id} (День {current_day})")
         except Exception as e:
             logger.error(f"Ошибка отправки утреннего пуша пользователю {chat_id}: {e}")
             
@@ -607,7 +664,7 @@ async def main():
     # 1. Утренний пуш каждый день в 09:00
     scheduler.add_job(
         send_morning_push,
-        trigger=CronTrigger(hour=9, minute=0, second=0),
+        trigger=CronTrigger(hour=9, minute=0, second=0, timezone=pytz.timezone('Europe/Kyiv')),
         id="morning_push",
         replace_existing=True
     )
@@ -615,7 +672,7 @@ async def main():
     # 2. Автоматический перенос пропущенных ответов в конце дня в 23:59
     scheduler.add_job(
         auto_postpone_unanswered_users,
-        trigger=CronTrigger(hour=23, minute=59, second=0),
+        trigger=CronTrigger(hour=23, minute=59, second=0, timezone=pytz.timezone('Europe/Kyiv')),
         id="auto_postpone",
         replace_existing=True
     )
